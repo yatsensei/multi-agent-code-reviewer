@@ -38,7 +38,7 @@ class AgentState(TypedDict):
 
 # --- 4. The Orchestration Pipeline ---
 def compile_graph(api_key):
-    llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", api_key=api_key, temperature=0)
+    llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", api_key=api_key, temperature=0, max_retries=6)
 
     def security_agent(state: AgentState):
         sys_prompt = "You are an expert cybersecurity engineer. Review for SQL injection, XSS, and vulnerabilities. Be concise."
