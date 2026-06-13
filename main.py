@@ -10,7 +10,6 @@ from langchain_core.messages import SystemMessage, HumanMessage
 st.set_page_config(page_title="Multi-Agent Code Reviewer", page_icon="🤖", layout="wide")
 
 # --- 1. Session & Memory Tracking ---
-# This ensures Streamlit remembers the exact paused state of your graph
 if "thread_id" not in st.session_state:
     st.session_state.thread_id = str(uuid.uuid4())
 if "memory" not in st.session_state:
@@ -23,7 +22,6 @@ with st.sidebar:
     st.markdown("[Get your free API key here](https://aistudio.google.com/app/apikey)")
     st.divider()
     
-    # Failsafe to clear the graph's memory if you want to start fresh
     if st.button("Reset Session Memory"):
         st.session_state.thread_id = str(uuid.uuid4())
         st.session_state.memory = MemorySaver()
@@ -71,7 +69,6 @@ def compile_graph(api_key):
     workflow.add_edge("style", "orchestrator")
     workflow.add_edge("orchestrator", END)
 
-    # THE CRITICAL HITL ADDITION: We attach the memory and set the breakpoint
     return workflow.compile(
         checkpointer=st.session_state.memory,
         interrupt_before=["orchestrator"]
@@ -82,11 +79,9 @@ st.title("🤖 AI Multi-Agent Code Reviewer (HITL Edition)")
 st.write("Submit code. The graph will pause after the initial agent reviews, requiring your human approval before compiling the final report.")
 st.divider()
 
-# --- NEW: Restored File Uploader Input Block ---
 st.subheader("1. Input Source Code")
 uploaded_file = st.file_uploader("Upload a Python file (.py)", type=["py"])
 
-# Determine code source (upload vs manual paste)
 if uploaded_file is not None:
     code_to_review = uploaded_file.getvalue().decode("utf-8")
     st.success(f"Successfully loaded: {uploaded_file.name}")
@@ -98,7 +93,51 @@ else:
 st.divider()
 st.subheader("2. Execute Audit")
 
-# Define the config with our persistent thread_id so the graph knows which memory to load
 config = {"configurable": {"thread_id": st.session_state.thread_id}}
 
-# ... [The rest of the if user_api_key: logic stays exactly the same]
+if user_api_key:
+    app = compile_graph(user_api_key)
+    current_state = app.get_state(config)
+    
+    # --- UI PHASE 2: Graph is Paused at Breakpoint ---
+    if "orchestrator" in current_state.next:
+        st.warning("✋ **HUMAN IN THE LOOP:** The agents have finished. Review their findings below and approve to compile the final report.")
+        
+        with st.expander("Review Raw Agent Logs (Click to expand)", expanded=True):
+            t1, t2, t3 = st.tabs(["Security", "Performance", "Style"])
+            with t1: st.write(current_state.values.get("security_feedback"))
+            with t2: st.write(current_state.values.get("performance_feedback"))
+            with t3: st.write(current_state.values.get("style_feedback"))
+            
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("✅ Approve & Compile Final Report", type="primary", use_container_width=True):
+                with st.spinner("Orchestrator compiling..."):
+                    app.invoke(None, config) 
+                st.rerun()
+        with col2:
+            if st.button("❌ Reject & Reset", use_container_width=True):
+                st.session_state.thread_id = str(uuid.uuid4())
+                st.rerun()
+                
+    # --- UI PHASE 3: Graph is Completed ---
+    elif current_state.values.get("final_summary"):
+        st.success("Analysis Compiled Successfully!")
+        st.markdown(current_state.values.get("final_summary"))
+        
+        if st.button("Start New Review", use_container_width=True):
+            st.session_state.thread_id = str(uuid.uuid4())
+            st.rerun()
+            
+    # --- UI PHASE 1: Graph is Idle (or stuck in an error) ---
+    else:
+        if st.button("1. Run Initial Agent Review", type="primary", use_container_width=True):
+            if not code_to_review.strip():
+                st.warning("⚠️ Please paste some code first.")
+            else:
+                with st.status("Agents analyzing...", expanded=True) as status:
+                    app.invoke({"pr_diff": code_to_review}, config)
+                    status.update(label="Breakpoint Reached. Awaiting Human Input.", state="complete")
+                st.rerun() 
+else:
+    st.info("👈 Please enter your API key in the sidebar to begin.")
