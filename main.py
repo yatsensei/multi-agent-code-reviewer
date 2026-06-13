@@ -1,23 +1,36 @@
 import os
+import uuid
 from typing import TypedDict
 import streamlit as st
 from langgraph.graph import StateGraph, START, END
+from langgraph.checkpoint.memory import MemorySaver
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import SystemMessage, HumanMessage
 
 st.set_page_config(page_title="Multi-Agent Code Reviewer", page_icon="🤖", layout="wide")
 
-# --- 1. Sidebar Configuration (BYOK Security) ---
+# --- 1. Session & Memory Tracking ---
+# This ensures Streamlit remembers the exact paused state of your graph
+if "thread_id" not in st.session_state:
+    st.session_state.thread_id = str(uuid.uuid4())
+if "memory" not in st.session_state:
+    st.session_state.memory = MemorySaver()
+
+# --- 2. Sidebar Configuration ---
 with st.sidebar:
     st.header("🔑 API Configuration")
-    st.write("This tool uses Google's Gemini 2.5 Flash model.")
-    # The password type hides the key as they type it
     user_api_key = st.text_input("Enter your Gemini API Key", type="password")
     st.markdown("[Get your free API key here](https://aistudio.google.com/app/apikey)")
     st.divider()
-    st.caption("Security Note: Your key is never stored or logged. It is only used for this temporary session.")
+    
+    # Failsafe to clear the graph's memory if you want to start fresh
+    if st.button("Reset Session Memory"):
+        st.session_state.thread_id = str(uuid.uuid4())
+        st.session_state.memory = MemorySaver()
+        st.success("Memory wiped. Ready for a new review.")
+        st.rerun()
 
-# --- 2. Shared Memory State ---
+# --- 3. Shared Memory State ---
 class AgentState(TypedDict):
     pr_diff: str               
     security_feedback: str     
@@ -25,33 +38,27 @@ class AgentState(TypedDict):
     style_feedback: str        
     final_summary: str         
 
-# --- 3. The Orchestration Pipeline ---
-# We wrap this in a function so it can dynamically accept the user's API key
-def run_audit_pipeline(code_snippet, api_key):
+# --- 4. The Orchestration Pipeline ---
+def compile_graph(api_key):
     llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", api_key=api_key, temperature=0)
 
     def security_agent(state: AgentState):
-        sys_prompt = "You are an expert cybersecurity engineer. Review the provided code diff for SQL injection, XSS, hardcoded secrets, and vulnerabilities. Be concise."
-        messages = [SystemMessage(content=sys_prompt), HumanMessage(content=state["pr_diff"])]
-        return {"security_feedback": llm.invoke(messages).content}
+        sys_prompt = "You are an expert cybersecurity engineer. Review for SQL injection, XSS, and vulnerabilities. Be concise."
+        return {"security_feedback": llm.invoke([SystemMessage(content=sys_prompt), HumanMessage(content=state["pr_diff"])]).content}
 
     def performance_agent(state: AgentState):
-        sys_prompt = "You are a performance optimization engineer. Review the code diff for Big-O complexity issues, memory leaks, and inefficient loops. Be concise."
-        messages = [SystemMessage(content=sys_prompt), HumanMessage(content=state["pr_diff"])]
-        return {"performance_feedback": llm.invoke(messages).content}
+        sys_prompt = "You are a performance optimization engineer. Review for Big-O complexity and memory leaks. Be concise."
+        return {"performance_feedback": llm.invoke([SystemMessage(content=sys_prompt), HumanMessage(content=state["pr_diff"])]).content}
 
     def style_agent(state: AgentState):
-        sys_prompt = "You are a strict Python PEP8 reviewer. Check for bad variable naming, lack of modularity, and poor formatting. Be concise."
-        messages = [SystemMessage(content=sys_prompt), HumanMessage(content=state["pr_diff"])]
-        return {"style_feedback": llm.invoke(messages).content}
+        sys_prompt = "You are a strict Python PEP8 reviewer. Check formatting and naming. Be concise."
+        return {"style_feedback": llm.invoke([SystemMessage(content=sys_prompt), HumanMessage(content=state["pr_diff"])]).content}
 
     def aggregator_orchestrator(state: AgentState):
-        sys_prompt = "You are a Lead DevOps Engineer. Synthesize the following three reports into one highly professional Markdown summary. Prioritize security and performance over style."
+        sys_prompt = "You are a Lead DevOps Engineer. Synthesize the reports into Markdown. Prioritize security."
         combined_input = f"Security: {state.get('security_feedback')}\nPerformance: {state.get('performance_feedback')}\nStyle: {state.get('style_feedback')}"
-        messages = [SystemMessage(content=sys_prompt), HumanMessage(content=combined_input)]
-        return {"final_summary": llm.invoke(messages).content}
+        return {"final_summary": llm.invoke([SystemMessage(content=sys_prompt), HumanMessage(content=combined_input)]).content}
 
-    # Construct the graph
     workflow = StateGraph(AgentState)
     workflow.add_node("security", security_agent)
     workflow.add_node("performance", performance_agent)
@@ -64,67 +71,71 @@ def run_audit_pipeline(code_snippet, api_key):
     workflow.add_edge("style", "orchestrator")
     workflow.add_edge("orchestrator", END)
 
-    app = workflow.compile()
-    return app.invoke({"pr_diff": code_snippet})
+    # THE CRITICAL HITL ADDITION: We attach the memory and set the breakpoint
+    return workflow.compile(
+        checkpointer=st.session_state.memory,
+        interrupt_before=["orchestrator"]
+    )
 
-# --- 4. Streamlit UI ---
-st.title("🤖 AI Multi-Agent Code Reviewer")
-st.caption("Powered by LangGraph & Gemini 2.5 Flash")
-st.write("Submit your code snippets below to trigger an automated, multi-perspective architectural audit.")
+# --- 5. Streamlit UI Routing ---
+st.title("🤖 AI Multi-Agent Code Reviewer (HITL Edition)")
+st.write("Submit code. The graph will pause after the initial agent reviews, requiring your human approval before compiling the final report.")
 st.divider()
 
-st.subheader("1. Input Source Code")
-uploaded_file = st.file_uploader("Upload a Python file (.py)", type=["py"])
-
-default_bad_code = """def get_user_data(username):
-    db = connect_to_db()
-    query = "SELECT * FROM users WHERE username = '" + username + "'"
-    data = db.execute(query)
-    results = []
-    for x in data:
-        for y in data:
-            if x == y:
-                results.append(x)
-                
-    API_KEY = "12345-secret-key"
-    return results"""
-
-if uploaded_file is not None:
-    code_to_review = uploaded_file.getvalue().decode("utf-8")
-    st.success(f"Successfully loaded: {uploaded_file.name}")
-    with st.expander("Preview Uploaded Code"):
-        st.code(code_to_review, language="python")
-else:
-    code_to_review = st.text_area("Or paste your Python code manually:", value=default_bad_code, height=250)
-
+# Input Block
+code_to_review = st.text_area("Paste your Python code here:", height=200)
 st.divider()
 st.subheader("2. Execute Audit")
 
-if st.button("Run Code Audit", type="primary", use_container_width=True):
-    # Safety Check: Did they enter an API key?
-    if not user_api_key:
-        st.error("⚠️ Please enter your Gemini API Key in the sidebar to run the audit.")
-    elif not code_to_review.strip():
-        st.warning("⚠️ Please paste or upload some code before running the analysis.")
-    else:
-        with st.status("Orchestrating AI Agents...", expanded=True) as status:
-            status.write("🛡️ Security Agent analyzing vulnerabilities...")
-            status.write("⚡ Performance Agent checking time complexity...")
-            status.write("💅 Style Agent verifying PEP8 compliance...")
-            
-            # Run the pipeline with the user's provided key
-            output = run_audit_pipeline(code_to_review, user_api_key)
-            
-            status.update(label="Audit Complete!", state="complete", expanded=False)
+# Define the config with our persistent thread_id so the graph knows which memory to load
+config = {"configurable": {"thread_id": st.session_state.thread_id}}
+
+if user_api_key:
+    app = compile_graph(user_api_key)
+    current_state = app.get_state(config)
+    
+    # --- UI PHASE 1: Graph is Idle ---
+    if not current_state.next and not current_state.values.get("final_summary"):
+        if st.button("1. Run Initial Agent Review", type="primary", use_container_width=True):
+            if not code_to_review.strip():
+                st.warning("⚠️ Please paste some code first.")
+            else:
+                with st.status("Agents analyzing...", expanded=True) as status:
+                    # Execute graph up until the breakpoint
+                    app.invoke({"pr_diff": code_to_review}, config)
+                    status.update(label="Breakpoint Reached. Awaiting Human Input.", state="complete")
+                st.rerun() # Refresh UI to show the approval buttons
+                
+    # --- UI PHASE 2: Graph is Paused at Breakpoint ---
+    elif "orchestrator" in current_state.next:
+        st.warning("✋ **HUMAN IN THE LOOP:** The agents have finished. Review their findings below and approve to compile the final report.")
         
+        with st.expander("Review Raw Agent Logs (Click to expand)", expanded=True):
+            t1, t2, t3 = st.tabs(["Security", "Performance", "Style"])
+            with t1: st.write(current_state.values.get("security_feedback"))
+            with t2: st.write(current_state.values.get("performance_feedback"))
+            with t3: st.write(current_state.values.get("style_feedback"))
+            
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("✅ Approve & Compile Final Report", type="primary", use_container_width=True):
+                with st.spinner("Orchestrator compiling..."):
+                    # Passing 'None' explicitly tells LangGraph to resume from the breakpoint
+                    app.invoke(None, config) 
+                st.rerun()
+        with col2:
+            if st.button("❌ Reject & Reset", use_container_width=True):
+                st.session_state.thread_id = str(uuid.uuid4())
+                st.rerun()
+                
+    # --- UI PHASE 3: Graph is Completed ---
+    elif current_state.values.get("final_summary"):
         st.success("Analysis Compiled Successfully!")
-        st.markdown(output["final_summary"])
+        st.markdown(current_state.values.get("final_summary"))
         
-        with st.expander("View Raw Agent Logs"):
-            tab1, tab2, tab3 = st.tabs(["Security Feedback", "Performance Feedback", "Style Feedback"])
-            with tab1:
-                st.markdown(output.get("security_feedback", "No data"))
-            with tab2:
-                st.markdown(output.get("performance_feedback", "No data"))
-            with tab3:
-                st.markdown(output.get("style_feedback", "No data"))
+        if st.button("Start New Review", use_container_width=True):
+            # Generate a new thread ID to start completely fresh
+            st.session_state.thread_id = str(uuid.uuid4())
+            st.rerun()
+else:
+    st.info("👈 Please enter your API key in the sidebar to begin.")
